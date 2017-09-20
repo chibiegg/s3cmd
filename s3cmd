@@ -586,7 +586,7 @@ def cmd_object_get(args):
             finally:
                 dst_stream.close()
         except S3DownloadError as e:
-            error(u"%s: Skipping that file.  This is usually a transient error, please try again later." % e)
+            error(u"'%s' %s: Skipping that file.  This is usually a transient error, please try again later." % (destination, e, ))
             if not file_exists: # Delete, only if file didn't exist before!
                 debug(u"object_get failed for '%s', deleting..." % (destination,))
                 os.unlink(deunicodise(destination))
@@ -596,6 +596,7 @@ def cmd_object_get(args):
                     break
             continue
         except S3Error as e:
+            error(u"'%s' %s: Skipping that file.  This is usually a transient error, please try again later." % (destination, e, ))
             if not file_exists: # Delete, only if file didn't exist before!
                 debug(u"object_get failed for '%s', deleting..." % (destination,))
                 os.unlink(deunicodise(destination))
