@@ -649,6 +649,7 @@ def cmd_object_get(args):
     ret = EX_OK
 
     global parallel
+    info("Parallel %d", parallel)
     pool = Pool(processes=parallel)
 
     args = []
@@ -660,6 +661,7 @@ def cmd_object_get(args):
     try:
         pool.map(_download_item, args)
     except KeyboardInterrupt:
+        exit(1)
         return EX_OK
 
     return EX_OK
@@ -2786,7 +2788,7 @@ def main():
     optparser.add_option(      "--content-disposition", dest="content_disposition", action="store", help="Provide a Content-Disposition for signed URLs, e.g., \"inline; filename=myvideo.mp4\"")
     optparser.add_option(      "--content-type", dest="content_type", action="store", help="Provide a Content-Type for signed URLs, e.g., \"video/mp4\"")
     optparser.add_option(      "--use-list", dest="use_list", action="store", help="filename to backup key list")
-    optparser.add_option(      "--parallel", dest="parallel", action="store", type="int", default=1, help="parallel count")
+    optparser.add_option(      "--parallel", dest="parallel", action="store", type="int", default=1, help="parallel count", default=1)
 
 
     optparser.set_usage(optparser.usage + " COMMAND [parameters]")
