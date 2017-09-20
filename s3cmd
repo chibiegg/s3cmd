@@ -37,6 +37,8 @@ import traceback
 import codecs
 import locale
 import subprocess
+import json
+from multiprocessing import Pool, TimeoutError
 try:
     import htmlentitydefs
 except:
@@ -61,6 +63,9 @@ from distutils.spawn import find_executable
 
 from ssl import SSLError
 import io
+
+use_list = None
+parallel = 1
 
 def output(message):
     sys.stdout.write(message + "\n")
@@ -448,6 +453,100 @@ def cmd_object_put(args):
             os.remove(deunicodise(full_name))
     return ret
 
+
+
+def _download_item(args):
+    cfg = args[0]
+    remote_count = args[1]
+    seq = args[2]
+    item = args[3]
+    s3 = S3(cfg)
+
+    debug(u"Start to download '%s'", item['object_uri_str'])
+    uri = S3Uri(item['object_uri_str'])
+    ## Encode / Decode destination with "replace" to make sure it's compatible with current encoding
+    destination = unicodise_safe(item['local_filename'])
+    seq_label = "[%d of %d]" % (seq+1, remote_count)
+
+    start_position = 0
+
+    if destination == "-":
+        ## stdout
+        dst_stream = io.open(sys.__stdout__.fileno(), mode='wb', closefd=False)
+        dst_stream.stream_name = u'<stdout>'
+        file_exists = True
+    else:
+        ## File
+        try:
+            file_exists = os.path.exists(deunicodise(destination))
+            try:
+                dst_stream = io.open(deunicodise(destination), mode='ab')
+                dst_stream.stream_name = destination
+            except IOError as e:
+                if e.errno == errno.ENOENT:
+                    basename = destination[:destination.rindex(os.path.sep)]
+                    info(u"Creating directory: %s" % basename)
+                    os.makedirs(deunicodise(basename))
+                    dst_stream = io.open(deunicodise(destination), mode='ab')
+                    dst_stream.stream_name = destination
+                else:
+                    raise
+            if file_exists:
+                if Config().get_continue:
+                    start_position = dst_stream.tell()
+                elif Config().force:
+                    start_position = 0
+                    dst_stream.seek(0)
+                    dst_stream.truncate()
+                elif Config().skip_existing:
+                    info(u"Skipping over existing file: %s" % (destination))
+                    return
+                else:
+                    dst_stream.close()
+                    raise ParameterError(u"File %s already exists. Use either of --force / --continue / --skip-existing or give it a new name." % destination)
+        except IOError as e:
+            error(u"Skipping %s: %s" % (destination, e.strerror))
+            return
+    try:
+        try:
+            response = s3.object_get(uri, dst_stream, destination, start_position = start_position, extra_label = seq_label)
+        finally:
+            dst_stream.close()
+    except S3DownloadError as e:
+        error(u"'%s' %s: Skipping that file.  This is usually a transient error, please try again later." % (destination, e, ))
+        if not file_exists: # Delete, only if file didn't exist before!
+            debug(u"object_get failed for '%s', deleting..." % (destination,))
+            os.unlink(deunicodise(destination))
+            ret = EX_PARTIAL
+            if cfg.stop_on_error:
+                ret = EX_DATAERR
+                raise e
+        return
+    except S3Error as e:
+        error(u"'%s' %s: Skipping that file.  This is usually a transient error, please try again later." % (destination, e, ))
+        if not file_exists: # Delete, only if file didn't exist before!
+            debug(u"object_get failed for '%s', deleting..." % (destination,))
+            os.unlink(deunicodise(destination))
+        return
+
+    if "x-amz-meta-s3tools-gpgenc" in response["headers"]:
+        gpg_decrypt(destination, response["headers"]["x-amz-meta-s3tools-gpgenc"])
+        response["size"] = os.stat(deunicodise(destination))[6]
+    if "last-modified" in response["headers"] and destination != "-":
+        last_modified = time.mktime(time.strptime(response["headers"]["last-modified"], "%a, %d %b %Y %H:%M:%S GMT"))
+        os.utime(deunicodise(destination), (last_modified, last_modified))
+        debug("set mtime to %s" % last_modified)
+    if not Config().progress_meter and destination != "-":
+        speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
+        output(u"download: '%s' -> '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s)" %
+            (uri, destination, response["size"], response["elapsed"], speed_fmt[0], speed_fmt[1]))
+    if Config().delete_after_fetch:
+        s3.object_delete(uri)
+        output(u"File '%s' removed after fetch" % (uri))
+
+
+
+
 def cmd_object_get(args):
     cfg = Config()
     s3 = S3(cfg)
@@ -495,7 +594,23 @@ def cmd_object_get(args):
     if len(args) == 0:
         raise ParameterError("Nothing to download. Expecting S3 URI.")
 
-    remote_list, exclude_list, remote_total_size = fetch_remote_list(args, require_attribs = False)
+    if use_list and os.path.exists(use_list):
+        with open(use_list, "r") as f:
+            remote_list = json.load(f)
+    else:
+        remote_list, exclude_list, remote_total_size = fetch_remote_list(args, require_attribs = False)
+
+        original_remote_list = remote_list
+        remote_list = []
+        for key, item in original_remote_list.items():
+            remote_list.append({
+                'key': key,
+                'object_uri_str': item['object_uri_str'],
+            })
+
+        if use_list:
+            with open(use_list, "w") as f:
+                json.dump(remote_list, f)
 
     remote_count = len(remote_list)
 
@@ -504,8 +619,8 @@ def cmd_object_get(args):
     if remote_count > 0:
         if destination_base == "-":
             ## stdout is ok for multiple remote files!
-            for key in remote_list:
-                remote_list[key]['local_filename'] = "-"
+            for item in remote_list:
+                item['local_filename'] = "-"
         elif not os.path.isdir(deunicodise(destination_base)):
             ## We were either given a file name (existing or not)
             if remote_count > 1:
@@ -514,108 +629,43 @@ def cmd_object_get(args):
         elif os.path.isdir(deunicodise(destination_base)):
             if destination_base[-1] != os.path.sep:
                 destination_base += os.path.sep
-            for key in remote_list:
-                local_filename = destination_base + key
+            for item in remote_list:
+                local_filename = destination_base + item['key']
                 if os.path.sep != "/":
                     local_filename = os.path.sep.join(local_filename.split("/"))
-                remote_list[key]['local_filename'] = local_filename
+                item['local_filename'] = local_filename
         else:
             raise InternalError("WTF? Is it a dir or not? -- %s" % destination_base)
 
     if cfg.dry_run:
         for key in exclude_list:
             output(u"exclude: %s" % key)
-        for key in remote_list:
-            output(u"download: '%s' -> '%s'" % (remote_list[key]['object_uri_str'], remote_list[key]['local_filename']))
+        for item in remote_list:
+            output(u"download: '%s' -> '%s'" % (item['object_uri_str'], item['local_filename']))
 
         warning(u"Exiting now because of --dry-run")
         return EX_OK
 
-    seq = 0
     ret = EX_OK
-    for key in remote_list:
-        seq += 1
-        item = remote_list[key]
-        uri = S3Uri(item['object_uri_str'])
-        ## Encode / Decode destination with "replace" to make sure it's compatible with current encoding
-        destination = unicodise_safe(item['local_filename'])
-        seq_label = "[%d of %d]" % (seq, remote_count)
 
-        start_position = 0
+    global parallel
+    info("Parallel %d", parallel)
+    pool = Pool(processes=parallel)
 
-        if destination == "-":
-            ## stdout
-            dst_stream = io.open(sys.__stdout__.fileno(), mode='wb', closefd=False)
-            dst_stream.stream_name = u'<stdout>'
-            file_exists = True
-        else:
-            ## File
-            try:
-                file_exists = os.path.exists(deunicodise(destination))
-                try:
-                    dst_stream = io.open(deunicodise(destination), mode='ab')
-                    dst_stream.stream_name = destination
-                except IOError as e:
-                    if e.errno == errno.ENOENT:
-                        basename = destination[:destination.rindex(os.path.sep)]
-                        info(u"Creating directory: %s" % basename)
-                        os.makedirs(deunicodise(basename))
-                        dst_stream = io.open(deunicodise(destination), mode='ab')
-                        dst_stream.stream_name = destination
-                    else:
-                        raise
-                if file_exists:
-                    if Config().get_continue:
-                        start_position = dst_stream.tell()
-                    elif Config().force:
-                        start_position = 0
-                        dst_stream.seek(0)
-                        dst_stream.truncate()
-                    elif Config().skip_existing:
-                        info(u"Skipping over existing file: %s" % (destination))
-                        continue
-                    else:
-                        dst_stream.close()
-                        raise ParameterError(u"File %s already exists. Use either of --force / --continue / --skip-existing or give it a new name." % destination)
-            except IOError as e:
-                error(u"Skipping %s: %s" % (destination, e.strerror))
-                continue
-        try:
-            try:
-                response = s3.object_get(uri, dst_stream, destination, start_position = start_position, extra_label = seq_label)
-            finally:
-                dst_stream.close()
-        except S3DownloadError as e:
-            error(u"%s: Skipping that file.  This is usually a transient error, please try again later." % e)
-            if not file_exists: # Delete, only if file didn't exist before!
-                debug(u"object_get failed for '%s', deleting..." % (destination,))
-                os.unlink(deunicodise(destination))
-                ret = EX_PARTIAL
-                if cfg.stop_on_error:
-                    ret = EX_DATAERR
-                    break
-            continue
-        except S3Error as e:
-            if not file_exists: # Delete, only if file didn't exist before!
-                debug(u"object_get failed for '%s', deleting..." % (destination,))
-                os.unlink(deunicodise(destination))
-            raise
+    args = []
+    for seq, item in enumerate(remote_list):
+        args.append(
+            (cfg, remote_count, seq, item)
+        )
 
-        if "x-amz-meta-s3tools-gpgenc" in response["headers"]:
-            gpg_decrypt(destination, response["headers"]["x-amz-meta-s3tools-gpgenc"])
-            response["size"] = os.stat(deunicodise(destination))[6]
-        if "last-modified" in response["headers"] and destination != "-":
-            last_modified = time.mktime(time.strptime(response["headers"]["last-modified"], "%a, %d %b %Y %H:%M:%S GMT"))
-            os.utime(deunicodise(destination), (last_modified, last_modified))
-            debug("set mtime to %s" % last_modified)
-        if not Config().progress_meter and destination != "-":
-            speed_fmt = formatSize(response["speed"], human_readable = True, floating_point = True)
-            output(u"download: '%s' -> '%s' (%d bytes in %0.1f seconds, %0.2f %sB/s)" %
-                (uri, destination, response["size"], response["elapsed"], speed_fmt[0], speed_fmt[1]))
-        if Config().delete_after_fetch:
-            s3.object_delete(uri)
-            output(u"File '%s' removed after fetch" % (uri))
+    try:
+        pool.map(_download_item, args)
+    except KeyboardInterrupt:
+        exit(1)
+        return EX_OK
+
     return EX_OK
+
 
 def cmd_object_del(args):
     cfg = Config()
@@ -2737,6 +2787,9 @@ def main():
     optparser.add_option(      "--stop-on-error", dest="stop_on_error", action="store_true", help="stop if error in transfer")
     optparser.add_option(      "--content-disposition", dest="content_disposition", action="store", help="Provide a Content-Disposition for signed URLs, e.g., \"inline; filename=myvideo.mp4\"")
     optparser.add_option(      "--content-type", dest="content_type", action="store", help="Provide a Content-Type for signed URLs, e.g., \"video/mp4\"")
+    optparser.add_option(      "--use-list", dest="use_list", action="store", help="filename to backup key list")
+    optparser.add_option(      "--parallel", dest="parallel", action="store", type="int", default=1, help="parallel count")
+
 
     optparser.set_usage(optparser.usage + " COMMAND [parameters]")
     optparser.set_description('S3cmd is a tool for managing objects in '+
@@ -2958,6 +3011,11 @@ def main():
 
     if options.content_type:
         cfg.content_type = options.content_type
+
+    global use_list
+    global parallel
+    use_list = options.use_list
+    parallel = options.parallel
 
     if len(args) < 1:
         optparser.print_help()
